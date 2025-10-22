@@ -1395,8 +1395,21 @@ update_images_and_status(handles);
 
         Te_fit = best_p_fit(1);
         alpha_fit = best_p_fit(2);
+        amp_fit = best_p_fit(3);
 
+        % Calculate ne from alpha (shape-based method - no intensity calibration used)
         ne_fit = calculate_ne_from_alpha_Te(alpha_fit, Te_fit, laser_wl);
+
+        % Diagnostic: what would intensity calibration give?
+        fitted_spectrum_check = coherent_fitter_direct(best_p_fit, wavelength_nm, laser_wl);
+        total_counts_check = sum(fitted_spectrum_check);
+        calib_factor = handles.plot_data.raman_results.calibration_factor;
+        total_energy_thomson = (handles.edit_energy_t.Value/1000) * handles.edit_shots_t.Value;
+        sigma_T_diff = 7.94e-30;
+        ne_from_intensity = total_counts_check / (calib_factor * total_energy_thomson * sigma_T_diff);
+        fprintf('\nNOTE - Shape Calib uses ne from alpha (shape only), not intensity:\n');
+        fprintf('  ne from alpha (used) = %.2e m^-3\n', ne_fit);
+        fprintf('  ne from intensity = %.2e m^-3 (ratio: %.2f x)\n\n', ne_from_intensity, ne_from_intensity/ne_fit);
 
         % === NEW: Monte Carlo error estimation for Shape Fit ===
         fprintf('Calculating realistic parameter errors via Monte Carlo sampling...\n');
@@ -1411,7 +1424,6 @@ update_images_and_status(handles);
 
         acceptable_Te = [];
         acceptable_ne = [];
-        amp_fit = best_p_fit(3);
 
         % Grid search over parameter space
         for Te_test = Te_range
@@ -1628,25 +1640,22 @@ update_images_and_status(handles);
         center_wl = p_fit_gauss(2);
         baseline = p_fit_gauss(4);
 
+        % Calculate the fitted total counts for scaling
+        fitted_total_counts = sum(gauss_fit_spectrum);
+
         % Grid search over parameter space
         for Te_test = Te_range
             for ne_test = ne_range
                 % Calculate FWHM from Te: Te = me_c2/(32*ln2) * (FWHM/laser_wl)^2
-                % => FWHM = sqrt(Te * 32*ln2 / me_c2) * laser_wl
                 fwhm_test = sqrt(Te_test * 32 * log(2) / me_c2_eV) * laser_wl;
 
-                % Calculate amplitude from ne
-                % ne = total_counts / (calib * energy * sigma)
-                % total_counts = sum(A * exp(...)) ≈ A * sqrt(pi) * FWHM / sqrt(4*ln2)
-                % So: A = ne * (calib * energy * sigma) / (sqrt(pi) * FWHM / sqrt(4*ln2))
-                counts_needed = ne_test * calib_factor * total_energy_thomson * sigma_T_diff;
-                gauss_integral_factor = sqrt(pi) * fwhm_test / sqrt(4 * log(2));
-                amp_test = counts_needed / gauss_integral_factor;
+                % Scale amplitude proportionally to ne (since ne ∝ total_counts ∝ amplitude for fixed shape)
+                amp_test = amp_fit * (ne_test / ne_fit);
 
                 % Generate synthetic Gaussian spectrum
                 test_spectrum = gauss_model([amp_test, center_wl, fwhm_test, baseline], wavelength_nm);
 
-                % Calculate residuals
+                % Calculate residuals (only in fitted region)
                 test_residuals = thomson_spectrum(fit_mask) - test_spectrum(fit_mask);
                 test_ssr = sum(test_residuals.^2);
 
