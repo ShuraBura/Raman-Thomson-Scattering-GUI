@@ -6,11 +6,13 @@ function results = analyze_RSTS(varargin)
 % - ENHANCED: Weighted fitting in Int.Calib.Full prioritizes central region
 %   around 532 nm using Gaussian weights (sigma=5 nm) to prevent fits from
 %   being pulled by distant wings
-% - ENHANCED: Monte Carlo-based error estimation provides realistic parameter
-%   uncertainties by finding all Te/ne combinations that produce visually
-%   acceptable fits (within 1.5x best SSR threshold)
+% - ENHANCED: Monte Carlo-based error estimation applied to ALL three fitting
+%   methods (Int.Calib.Full, Shape Calib., Int.Calib.Gauss) provides realistic
+%   parameter uncertainties by finding all Te/ne combinations that produce
+%   visually acceptable fits (within 1.5x best SSR threshold)
 % - IMPROVED: Errors now typically 10-100x larger, matching empirical ±15%
 %   criterion for visually indistinguishable synthetic spectra
+% - UNIFIED: All fitting callbacks now use consistent Monte Carlo error approach
 %
 % V9.8 Changes:
 % - ADDED: Automatic update of Te, ne, alpha fields after Gaussian fit
@@ -1396,20 +1398,54 @@ update_images_and_status(handles);
 
         ne_fit = calculate_ne_from_alpha_Te(alpha_fit, Te_fit, laser_wl);
 
-        % Calculate parameter errors and propagate to ne
-        Te_fit_err = 0; ne_fit_err = 0;
-        dof = sum(fit_mask) - length(best_p_fit);
-        if dof > 0 && ~isempty(best_jacobian) && rcond(full(best_jacobian' * best_jacobian)) > 1e-15
-            covB = best_resnorm / dof * inv(best_jacobian' * best_jacobian);
-            p_err = full(sqrt(diag(covB)));
-            Te_fit_err = p_err(1);
-            alpha_fit_err = p_err(2);
+        % === NEW: Monte Carlo error estimation for Shape Fit ===
+        fprintf('Calculating realistic parameter errors via Monte Carlo sampling...\n');
 
-            % Propagate error: ne = C*alpha^2*Te => (dne/ne)^2 = (2*d_alpha/alpha)^2 + (d_Te/Te)^2
-            if alpha_fit > 0 && Te_fit > 0
-                ne_rel_err_sq = (2 * alpha_fit_err / alpha_fit)^2 + (Te_fit_err / Te_fit)^2;
-                ne_fit_err = ne_fit * sqrt(ne_rel_err_sq);
+        % Define search ranges (±30% to capture typical variations)
+        Te_range = linspace(Te_fit * 0.7, Te_fit * 1.3, 25);
+        ne_range = linspace(ne_fit * 0.7, ne_fit * 1.3, 25);
+
+        % Define acceptable SSR threshold (1.5x best fit)
+        acceptable_ssr_threshold = best_resnorm * 1.5;
+        fprintf('  SSR threshold for acceptable fits: %.2e (best fit SSR = %.2e)\n', acceptable_ssr_threshold, best_resnorm);
+
+        acceptable_Te = [];
+        acceptable_ne = [];
+        amp_fit = best_p_fit(3);
+
+        % Grid search over parameter space
+        for Te_test = Te_range
+            for ne_test = ne_range
+                % Calculate alpha for this Te/ne combination
+                alpha_test = calculate_alpha_from_ne(Te_test, ne_test, laser_wl);
+
+                % Generate synthetic spectrum with these parameters
+                test_spectrum = coherent_fitter_direct([Te_test, alpha_test, amp_fit], wavelength_nm, laser_wl);
+
+                % Calculate unweighted residuals
+                test_residuals = thomson_spectrum(fit_mask) - test_spectrum(fit_mask);
+                test_ssr = sum(test_residuals.^2);
+
+                % If this fit is within acceptable threshold, add to list
+                if test_ssr < acceptable_ssr_threshold
+                    acceptable_Te = [acceptable_Te, Te_test];
+                    acceptable_ne = [acceptable_ne, ne_test];
+                end
             end
+        end
+
+        % Calculate errors as half the range of acceptable values
+        if ~isempty(acceptable_Te)
+            Te_fit_err = (max(acceptable_Te) - min(acceptable_Te)) / 2;
+            ne_fit_err = (max(acceptable_ne) - min(acceptable_ne)) / 2;
+            fprintf('  Monte Carlo results: %d parameter sets within acceptable SSR\n', length(acceptable_Te));
+            fprintf('  Te range: %.2f to %.2f eV (error = %.2f eV, %.1f%%)\n', min(acceptable_Te), max(acceptable_Te), Te_fit_err, 100*Te_fit_err/Te_fit);
+            fprintf('  ne range: %.2e to %.2e m^-3 (error = %.2e m^-3, %.1f%%)\n', min(acceptable_ne), max(acceptable_ne), ne_fit_err, 100*ne_fit_err/ne_fit);
+        else
+            % Fallback: use 15% as empirically observed typical error
+            Te_fit_err = Te_fit * 0.15;
+            ne_fit_err = ne_fit * 0.15;
+            fprintf('  Warning: No parameter sets found within threshold. Using fallback 15%% errors.\n');
         end
 
         fitted_spectrum = coherent_fitter_direct(best_p_fit, wavelength_nm, laser_wl);
@@ -1444,7 +1480,7 @@ update_images_and_status(handles);
             xlabel(handles.ax4, 'Wavelength (nm)'); ylabel(handles.ax4, 'Intensity (counts)');
         end
 
-        title(handles.ax4, sprintf('Shape Fit: Te=%.2f \\pm %.2f eV, n_{e,inst}=%.2e \\pm %.2e m^{-3}, \\alpha=%.2f\nSSR=%.2e, R^2=%.3f', Te_fit, Te_fit_err, ne_fit, ne_fit_err, alpha_fit, ssr_shape, r_squared_shape));
+        title(handles.ax4, sprintf('Shape Fit (MC errors): Te=%.2f \\pm %.2f eV, n_{e,inst}=%.2e \\pm %.2e m^{-3}, \\alpha=%.2f\nSSR=%.2e, R^2=%.3f', Te_fit, Te_fit_err, ne_fit, ne_fit_err, alpha_fit, ssr_shape, r_squared_shape));
 
         update_status(handles, 'Ready', [0, 0.5, 0]);
         guidata(hObject, handles);
@@ -1576,21 +1612,64 @@ update_images_and_status(handles);
 
         ne_fit = total_counts / (calib_factor * total_energy_thomson * sigma_T_diff);
 
-        % Calculate errors
-        Te_fit_err = 0;
-        ne_fit_err = 0;
-        dof = sum(fit_mask) - length(p_fit_gauss);
-        if dof > 0 && ~isempty(best_jacobian) && rcond(full(best_jacobian' * best_jacobian)) > 1e-15
-            covB = best_resnorm_gauss / dof * inv(best_jacobian' * best_jacobian);
-            p_err = full(sqrt(diag(covB)));
-            fwhm_err = p_err(3);
-            amp_err = p_err(1);
+        % === NEW: Monte Carlo error estimation for Gaussian Fit ===
+        fprintf('Calculating realistic parameter errors via Monte Carlo sampling...\n');
 
-            % Propagate FWHM error to Te: Te ~ FWHM^2
-            Te_fit_err = Te_fit * (2 * fwhm_err / fwhm_fit);
+        % Define search ranges (±30% to capture typical variations)
+        Te_range = linspace(Te_fit * 0.7, Te_fit * 1.3, 25);
+        ne_range = linspace(ne_fit * 0.7, ne_fit * 1.3, 25);
 
-            % Propagate amplitude error to ne: ne ~ total_counts ~ amplitude
-            ne_fit_err = ne_fit * (amp_err / amp_fit);
+        % Define acceptable SSR threshold (1.5x best fit)
+        acceptable_ssr_threshold = best_resnorm_gauss * 1.5;
+        fprintf('  SSR threshold for acceptable fits: %.2e (best fit SSR = %.2e)\n', acceptable_ssr_threshold, best_resnorm_gauss);
+
+        acceptable_Te = [];
+        acceptable_ne = [];
+        center_wl = p_fit_gauss(2);
+        baseline = p_fit_gauss(4);
+
+        % Grid search over parameter space
+        for Te_test = Te_range
+            for ne_test = ne_range
+                % Calculate FWHM from Te: Te = me_c2/(32*ln2) * (FWHM/laser_wl)^2
+                % => FWHM = sqrt(Te * 32*ln2 / me_c2) * laser_wl
+                fwhm_test = sqrt(Te_test * 32 * log(2) / me_c2_eV) * laser_wl;
+
+                % Calculate amplitude from ne
+                % ne = total_counts / (calib * energy * sigma)
+                % total_counts = sum(A * exp(...)) ≈ A * sqrt(pi) * FWHM / sqrt(4*ln2)
+                % So: A = ne * (calib * energy * sigma) / (sqrt(pi) * FWHM / sqrt(4*ln2))
+                counts_needed = ne_test * calib_factor * total_energy_thomson * sigma_T_diff;
+                gauss_integral_factor = sqrt(pi) * fwhm_test / sqrt(4 * log(2));
+                amp_test = counts_needed / gauss_integral_factor;
+
+                % Generate synthetic Gaussian spectrum
+                test_spectrum = gauss_model([amp_test, center_wl, fwhm_test, baseline], wavelength_nm);
+
+                % Calculate residuals
+                test_residuals = thomson_spectrum(fit_mask) - test_spectrum(fit_mask);
+                test_ssr = sum(test_residuals.^2);
+
+                % If this fit is within acceptable threshold, add to list
+                if test_ssr < acceptable_ssr_threshold
+                    acceptable_Te = [acceptable_Te, Te_test];
+                    acceptable_ne = [acceptable_ne, ne_test];
+                end
+            end
+        end
+
+        % Calculate errors as half the range of acceptable values
+        if ~isempty(acceptable_Te)
+            Te_fit_err = (max(acceptable_Te) - min(acceptable_Te)) / 2;
+            ne_fit_err = (max(acceptable_ne) - min(acceptable_ne)) / 2;
+            fprintf('  Monte Carlo results: %d parameter sets within acceptable SSR\n', length(acceptable_Te));
+            fprintf('  Te range: %.2f to %.2f eV (error = %.2f eV, %.1f%%)\n', min(acceptable_Te), max(acceptable_Te), Te_fit_err, 100*Te_fit_err/Te_fit);
+            fprintf('  ne range: %.2e to %.2e m^-3 (error = %.2e m^-3, %.1f%%)\n', min(acceptable_ne), max(acceptable_ne), ne_fit_err, 100*ne_fit_err/ne_fit);
+        else
+            % Fallback: use 15% as empirically observed typical error
+            Te_fit_err = Te_fit * 0.15;
+            ne_fit_err = ne_fit * 0.15;
+            fprintf('  Warning: No parameter sets found within threshold. Using fallback 15%% errors.\n');
         end
 
         % Calculate R^2
@@ -1625,7 +1704,7 @@ update_images_and_status(handles);
         legend(handles.ax4, 'Location', 'best');
         xlabel(handles.ax4, 'Wavelength (nm)');
         ylabel(handles.ax4, 'Intensity (counts)');
-        title(handles.ax4, sprintf('Intensity-Calibrated Gaussian Fit (SSR=%.2e, R²=%.3f)\nTe = %.2f \\pm %.2f eV, ne = %.2e \\pm %.2e m^{-3}', ssr, r_squared, Te_fit, Te_fit_err, ne_fit, ne_fit_err));
+        title(handles.ax4, sprintf('Int. Cal. Gaussian (MC errors) (SSR=%.2e, R²=%.3f)\nTe = %.2f \\pm %.2f eV, ne = %.2e \\pm %.2e m^{-3}', ssr, r_squared, Te_fit, Te_fit_err, ne_fit, ne_fit_err));
 
         update_status(handles, 'Ready', [0, 0.5, 0]);
         guidata(hObject, handles);
