@@ -257,7 +257,8 @@ resnorm_gauss = best_resnorm_gauss;
 fwhm_uncorrected = p_fit_gauss(3); amp_uncorrected = p_fit_gauss(1);
 Te_uncorrected = me_c2_eV / (32 * log(2)) * (fwhm_uncorrected / params.laser_wavelength)^2;
 total_energy_thomson = params.energy_J_thomson * params.shots_thomson;
-gauss_fit_spectrum = gauss_model(p_fit_gauss, wavelength_nm(fit_mask));
+% Fixed: Calculate spectrum over FULL wavelength range for total counts
+gauss_fit_spectrum = gauss_model(p_fit_gauss, wavelength_nm);
 total_counts_uncorrected = sum(gauss_fit_spectrum);
 ne_uncorrected = total_counts_uncorrected / (calibration_factor * total_energy_thomson * sigma_T_differential);
 
